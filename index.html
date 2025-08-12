@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <title>Simulação de Semáforo - MQTT</title>
+    <style>
+        body { font-family: Arial, sans-serif; text-align: center; background: #f4f4f4; }
+        .container { display: flex; justify-content: center; gap: 50px; margin-top: 50px; }
+        .semaforo { width: 80px; background: #333; border-radius: 15px; padding: 20px; }
+        .luz { width: 50px; height: 50px; margin: 10px auto; border-radius: 50%; background: #111; transition: background 0.3s; }
+        .vermelho.on { background: red; }
+        .amarelo.on { background: yellow; }
+        .verde.on { background: limegreen; }
+        button { padding: 10px 15px; margin-top: 15px; border: none; border-radius: 8px; cursor: pointer; background: #007BFF; color: white; font-size: 14px; }
+        button.stop { background: #dc3545; }
+        h2 { color: #333; }
+        .status-bar { margin-top: 20px; font-weight: bold; }
+        .mqtt-status { margin-top: 6px; font-size: 13px; color: #555; }
+    </style>
+</head>
+<body>
+
+    <h1>Simulação de Semáforo (MQTT)</h1>
+
+    <div class="container">
+        <!-- Semáforo Carro -->
+        <div>
+            <h2>Carro</h2>
+            <div class="semaforo" id="carro">
+                <div class="luz vermelho" id="carro-vermelho"></div>
+                <div class="luz amarelo" id="carro-amarelo"></div>
+                <div class="luz verde" id="carro-verde"></div>
+            </div>
+            <button onclick="localStart()">Iniciar</button>
+            <button class="stop" onclick="localStop()">Parar</button>
+        </div>
+
+        <!-- Semáforo Pedestre -->
+        <div>
+            <h2>Pedestre</h2>
+            <div class="semaforo" id="pedestre">
+                <div class="luz vermelho" id="pedestre-vermelho"></div>
+                <div class="luz verde" id="pedestre-verde"></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="status-bar">
+      Estado do sistema: <span id="systemState">desconhecido</span>
+      <div class="mqtt-status">MQTT: <span id="mqttState">desconectado</span></div>
+    </div>
+
+    <!-- mqtt.js CDN -->
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+
+    <script>
+    // ------- CONFIGURE AQUI -------
+    // Use ws:// para HTTP local; wss:// para HTTPS (requer broker com TLS)
+    const BROKER_WS = "ws://broker.hivemq.com:8000/mqtt"; // ex: "ws://192.168.0.50:9001" ou "wss://broker.exemplo.com:8884/mqtt"
+    const TOPIC_CTRL   = "semaforo/controle";
+    const TOPIC_STATUS = "semaforo/status";
+    // -------------------------------
+
+    // Estado local
+    let localRunning = false;
+    let intervalId = null;
+    let estadoCarro = 0; // 0 = vermelho, 1 = verde, 2 = amarelo
+    let estadoPedestre = 0; // 0 = vermelho, 1 = verde
+
+    // Elementos
+    const systemStateEl = document.getElementById('systemState');
+    const mqttStateEl = document.getElementById('mqttState');
+
+    // MQTT client config (sem usuário/senha)
+    const clientId = 'webclient-' + Math.random().toString(16).substr(2, 8);
+    const mqttOptions = {
+        clientId,
+        reconnectPeriod: 2000,
+        clean: true
+    };
+    const client = mqtt.connect(BROKER_WS, mqttOptions);
+
+    client.on('connect', () => {
+        mqttStateEl.textContent = 'conectado';
+        client.subscribe(TOPIC_STATUS, {qos:1}, (err) => {
+            if (!err) console.log('Subscribed to', TOPIC_STATUS);
+        });
+        // Se topic é retained, vai receber estado automaticamente; se não, pode publicar um pedido ou confiar no botão
+    });
+
+    client.on('reconnect', () => mqttStateEl.textContent = 'reconectando...');
+    client.on('close',   () => mqttStateEl.textContent = 'fechado');
+    client.on('offline', () => mqttStateEl.textContent = 'offline');
+    client.on('error',   (err) => { mqttStateEl.textContent = 'erro'; console.error('MQTT error', err); });
+
+    client.on('message', (topic, message) => {
+        if (topic === TOPIC_STATUS) {
+            const msg = message.toString();
+            console.log('status:', msg);
+            if (msg === 'running') {
+                systemSetRunning(true, /*originRemote=*/true);
+            } else if (msg === 'stopped') {
+                systemSetRunning(false, /*originRemote=*/true);
+            }
+        }
+    });
+
+    // ---------- Funções locais do semáforo (UI) ----------
+    function resetarLuzes() {
+        document.querySelectorAll('.luz').forEach(l => l.classList.remove('on'));
+    }
+
+    function tickLocal() {
+        // ciclo carro: vermelho -> verde -> amarelo -> vermelho ...
+        resetarLuzes();
+        if (estadoCarro === 0) { // vermelho carro (pedestre verde)
+            document.getElementById("carro-vermelho").classList.add("on");
+            document.getElementById("pedestre-vermelho").classList.remove("on");
+            document.getElementById("pedestre-verde").classList.remove("on");
+        } else if (estadoCarro === 1) { // verde carro
+            document.getElementById("carro-verde").classList.add("on");
+            document.getElementById("pedestre-vermelho").classList.add("on");
+        } else if (estadoCarro === 2) { // amarelo
+            document.getElementById("carro-amarelo").classList.add("on");
+        }
+
+        // pedestre state (keeps in sync with carro logic)
+        if (estadoCarro === 0) { // when carro is red, pedestre can be green
+            document.getElementById("pedestre-verde").classList.add("on");
+            document.getElementById("pedestre-vermelho").classList.remove("on");
+        } else {
+            document.getElementById("pedestre-vermelho").classList.add("on");
+            document.getElementById("pedestre-verde").classList.remove("on");
+        }
+    }
+
+    function startLocalLoop() {
+        // evita múltiplos intervalos
+        if (intervalId) clearInterval(intervalId);
+        // inicial states: vermelho (0) -> verde (1) -> amarelo (2)
+        estadoCarro = 1; // começamos com verde carro
+        tickLocal();
+        intervalId = setInterval(() => {
+            if (estadoCarro === 1) estadoCarro = 2;
+            else if (estadoCarro === 2) estadoCarro = 0;
+            else if (estadoCarro === 0) estadoCarro = 1;
+            tickLocal();
+        }, 4000); // intervalo 4s; ajuste conforme quiser
+    }
+
+    function stopLocalLoop() {
+        if (intervalId) {
+            clearInterval(intervalId);
+            intervalId = null;
+        }
+        resetarLuzes();
+    }
+
+    // ---------- Funções expostas aos botões ----------
+    // Quando usuário clica no site: publica no broker e também inicia localmente
+    function localStart() {
+        // publica start
+        if (client.connected) client.publish(TOPIC_CTRL, 'start');
+        // também inicia localmente (para resposta imediata)
+        systemSetRunning(true, /*originRemote=*/false);
+    }
+
+    function localStop() {
+        if (client.connected) client.publish(TOPIC_CTRL, 'stop');
+        systemSetRunning(false, /*originRemote=*/false);
+    }
+
+    // centraliza a alteração de estado local vs remoto
+    // originRemote true = veio do broker/ESP; false = veio do usuário (publicou)
+    function systemSetRunning(val, originRemote) {
+        if (val === localRunning) return; // já no estado desejado
+        localRunning = val;
+        systemStateEl.textContent = localRunning ? 'rodando' : 'parado';
+        if (localRunning) startLocalLoop();
+        else stopLocalLoop();
+        // se o comando veio remoto, não republicamos (evita loop)
+        // se veio local (usuario), já publicamos antes de chamar esta função
+    }
+
+    // Inicial status conhecido: tenta solicitar retained via subscribe — se o broker usar retained, recebemos automaticamente.
+    // Caso queira forçar um pedido, poderia publicar em outro tópico de request (não implementado aqui).
+
+    // Expor as funções para o HTML (se preferir manter handlers inline)
+    window.localStart = localStart;
+    window.localStop  = localStop;
+
+    </script>
+
+</body>
+</html>
